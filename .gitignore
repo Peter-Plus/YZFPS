@@ -1,0 +1,29 @@
+# Visual Studio
+.vs/
+*.VC.db
+*.opensdf
+*.opendb
+*.sdf
+*.sln
+*.suo
+*.xcodeproj
+*.xcworkspace
+
+# UE 自动生成目录
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# 临时文件
+*.tmp
+*.log
+
+# 用户配置
+*.user
+
+# UE 关卡光照烘焙数据（每次构建变化、体积大、不该入库）
+*_BuiltData.uasset
+# 大文件类型（防御）
+*.umap_BuiltData
