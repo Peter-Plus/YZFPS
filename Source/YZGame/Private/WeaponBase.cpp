@@ -8,7 +8,9 @@
 #include "Particles/ParticleSystemComponent.h"
 #include "Kismet/GameplayStatics.h"
 #include "GameFramework/PlayerController.h"
+#include "GameFramework/Pawn.h"
 #include "Engine/World.h"
+#include "Engine/Engine.h"
 
 // Sets default values
 AWeaponBase::AWeaponBase()
@@ -63,6 +65,7 @@ void AWeaponBase::Tick(float DeltaTime)
 	{
 		AddActorWorldRotation(FRotator(0.0f, IdleRotateSpeed, 0.0f));
 	}
+	UpdateShakeChannels(DeltaTime);
 }
 
 void AWeaponBase::OnPickupSphereBeginOverlap(
@@ -85,13 +88,22 @@ void AWeaponBase::OnPickupSphereBeginOverlap(
 	SetActorRelativeRotation(FRotator::ZeroRotator);
 	if (WeaponMesh != nullptr) WeaponMesh->SetRelativeLocation(FVector::ZeroVector);
 
+	SetOwner(PickerPawn);
 	OnPickedUp(PickerPawn);
 }
 
 void AWeaponBase::Fire()
 {
+	if (WeaponMesh == nullptr) return;
 	UWorld* World = GetWorld();
 	if (World == nullptr) return;
+	// 调试日志：打印 Fire 时三个通道的强度
+	UE_LOG(LogTemp, Warning, TEXT("Fire | Speed=%.2f | FireCh=%.2f | Crouch=%.2f | OwnerVel=%.2f"),
+		SpeedChannel.Strength,
+		FireChannel.Strength,
+		CrouchChannel.Strength,
+		GetOwner() ? GetOwner()->GetVelocity().Size() : -1.0f);
+
 	//1.获取枪口位置方向
 	const FVector MuzzleLocation = WeaponMesh->GetSocketLocation(MuzzleSocketName);
 	//2.算射击方向
@@ -100,42 +112,125 @@ void AWeaponBase::Fire()
 	int32 ViewportX = 0, ViewportY = 0;
 	PC->GetViewportSize(ViewportX, ViewportY);
 
-	FVector ScreenWorldLocation;
-	FVector ScreenWorldDirection;
-	const bool bDeprojected = PC->DeprojectScreenPositionToWorld(
-		ViewportX * 0.5f,
-		ViewportY * 0.5f,
-		ScreenWorldLocation,
-		ScreenWorldDirection
-	);
+	// 三通道各自随机偏移（X 和 Y 独立）
+	auto RandomOffset = [](float Strength) -> FVector2D
+		{
+			return FVector2D(
+				FMath::RandRange(-Strength, Strength),
+				FMath::RandRange(-Strength, Strength)
+			);
+		};
 
-	if (!bDeprojected) return;
+	const FVector2D TotalOffset =
+		RandomOffset(SpeedChannel.Strength) +
+		RandomOffset(FireChannel.Strength) +
+		RandomOffset(CrouchChannel.Strength);
 
-	//3.射线起点-屏幕中心，终点是远处
-	const FVector TraceStart = ScreenWorldLocation;
-	const FVector TraceEnd = ScreenWorldLocation + ScreenWorldDirection * TraceDistance;
+	const float CenterScreenX = ViewportX * 0.5f;
+	const float CenterScreenY = ViewportY * 0.5f;
+	const float AimedScreenX = CenterScreenX + TotalOffset.X;
+	const float AimedScreenY = CenterScreenY + TotalOffset.Y;
 
-	//4.做射线检测
+	//3. Deproject 偏移屏幕中心 → 拿到瞄准方向，构造前方 5m 瞄准点 ===
+	FVector AimedWorldPos;
+	FVector AimedWorldDir;
+	if (!PC->DeprojectScreenPositionToWorld(AimedScreenX, AimedScreenY, AimedWorldPos, AimedWorldDir))
+	{
+		return;
+	}
+	const FVector Aim5mPoint = AimedWorldPos + AimedWorldDir * 500.0f;  // 前方5m魔法距离
+
+
+	//4. Deproject 屏幕中心 → 射线起点 ===
+	FVector CenterWorldPos;
+	FVector CenterWorldDir;
+	if (!PC->DeprojectScreenPositionToWorld(CenterScreenX, CenterScreenY, CenterWorldPos, CenterWorldDir))
+	{
+		return;
+	}
+
+	//5. 实际射线方向 = 屏幕中心 → 5m 瞄准点 ===
+	const FVector RayDir = (Aim5mPoint - CenterWorldPos).GetSafeNormal();
+
+	//6. 射线起点屏幕中心、终点起点 + 方向 * TraceDistance ===
+	const FVector TraceStart = CenterWorldPos;
+	const FVector TraceEnd = CenterWorldPos + RayDir * TraceDistance;
+
+	//7. 射线检测 ===
 	FHitResult Hit;
 	FCollisionQueryParams QueryParams;
 	QueryParams.AddIgnoredActor(this);
 
 	const bool bHit = World->LineTraceSingleByChannel(
-		Hit,
-		TraceStart,
-		TraceEnd,
-		ECC_Visibility,
-		QueryParams
+		Hit, TraceStart, TraceEnd, ECC_Visibility, QueryParams
 	);
 
-	//5.如果命中，设命中点为终点，否则用射线检测终点
+	//8.如果命中，设命中点为终点，否则用射线检测终点
 	const FVector ImpactPoint = bHit ? Hit.ImpactPoint : TraceEnd;
 
-	//6.播放音效和枪口火焰
+	//9.播放音效和枪口火焰
 	FireAudio->Activate(true);
 	MuzzleParticle->Activate(true);
 
-	//7.通知蓝图，生成子弹设置速度
+	//10.通知蓝图，生成子弹设置速度
 	OnFireBullet(MuzzleLocation, ImpactPoint);
+
+	//11.开火脉冲——直接加，不平滑
+	FireChannel.Strength = FMath::Min(
+		FireChannel.Strength + FireChannel.PulseAmount,
+		FireChannel.MaxStrength
+	);
+}
+
+void AWeaponBase::AddCrouchPulse()
+{
+	CrouchChannel.Strength = FMath::Min(
+		CrouchChannel.Strength + CrouchChannel.PulseAmount,
+		CrouchChannel.MaxStrength
+	);
+}
+
+void AWeaponBase::UpdateShakeChannels(float DeltaTime)
+{
+	// SpeedChannel：追当前 Owner 的速度对应的目标强度
+	APawn* OwnerPawn = Cast<APawn>(GetOwner());
+	if (OwnerPawn != nullptr)
+	{
+		const float CurrentSpeed = OwnerPawn->GetVelocity().Size();
+		const float TargetStrength = FMath::Min(
+			CurrentSpeed * SpeedToStrengthRatio,
+			SpeedChannel.MaxStrength
+		);
+		SpeedChannel.Strength = FMath::FInterpTo(
+			SpeedChannel.Strength, TargetStrength, DeltaTime, SpeedChannel.SmoothSpeed
+		);
+	}
+
+	// FireChannel：追 0（衰减）
+	FireChannel.Strength = FMath::FInterpTo(
+		FireChannel.Strength, 0.0f, DeltaTime, FireChannel.SmoothSpeed
+	);
+
+	// CrouchChannel：追 0（衰减）
+	CrouchChannel.Strength = FMath::FInterpTo(
+		CrouchChannel.Strength, 0.0f, DeltaTime, CrouchChannel.SmoothSpeed
+	);
+
+	// 调试：屏幕上实时显示三个通道的强度
+	if (GEngine != nullptr)
+	{
+		GEngine->AddOnScreenDebugMessage(
+			1, 0.0f, FColor::Yellow,
+			FString::Printf(TEXT("Speed: %.2f"), SpeedChannel.Strength)
+		);
+		GEngine->AddOnScreenDebugMessage(
+			2, 0.0f, FColor::Cyan,
+			FString::Printf(TEXT("Fire:  %.2f"), FireChannel.Strength)
+		);
+		GEngine->AddOnScreenDebugMessage(
+			3, 0.0f, FColor::Green,
+			FString::Printf(TEXT("Crouch:%.2f"), CrouchChannel.Strength)
+		);
+	}
 }
 
